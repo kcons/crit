@@ -335,17 +335,48 @@ func renderFull(st *CritState) {
 	fmt.Printf("(fetched %s ago)\n", formatRelativeAge(st.GeneratedAt))
 }
 
-func renderPrompt(st *CritState) {
+func formatPromptString(st *CritState, useColors bool) string {
 	reviewCount, reviewStale := countReviews(st.PullRequests)
 	authoredCount, authoredRed, authoredOrange := countAuthored(st.AuthoredPullRequests)
 	
 	if reviewCount == 0 && authoredCount == 0 {
-		return
+		return "👍"
 	}
 	
-	left := formatCount(reviewCount, reviewStale && reviewCount > 0, false)
-	right := formatCount(authoredCount, authoredRed && authoredCount > 0, authoredOrange && authoredCount > 0)
-	fmt.Print(left + "|" + right)
+	parts := []string{}
+	
+	if reviewCount > 0 {
+		var countStr string
+		if useColors {
+			countStr = formatCount(reviewCount, reviewStale, false)
+		} else {
+			countStr = fmt.Sprintf("%d", reviewCount)
+		}
+		parts = append(parts, "🔍"+countStr)
+	}
+	
+	if authoredCount > 0 {
+		var countStr string
+		if useColors {
+			countStr = formatCount(authoredCount, authoredRed, authoredOrange)
+		} else {
+			countStr = fmt.Sprintf("%d", authoredCount)
+		}
+		parts = append(parts, "🚢"+countStr)
+	}
+	
+	if len(parts) == 1 {
+		return parts[0]
+	}
+	if len(parts) == 2 {
+		return parts[0] + " " + parts[1]
+	}
+	
+	return ""
+}
+
+func renderPrompt(st *CritState) {
+	fmt.Print(formatPromptString(st, true))
 }
 
 func countReviews(prs []PullRequestState) (count int, hasStale bool) {
