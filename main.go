@@ -97,7 +97,7 @@ func defaultStatePath() string { return filepath.Join(mustUserHomeDir(), ".crit_
 func mustUserHomeDir() string {
 	h, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		log.Fatalf("failed to get home directory: %v", err)
 	}
 	return h
 }
@@ -165,42 +165,32 @@ func fetchAuthored(repo, repoDir string) ([]ghPR, error) {
 // ----- State I/O -----
 
 func readState(path string) (*CritState, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	defer f.Close()
-	info, _ := f.Stat()
-	if info != nil && info.Size() == 0 {
+	
+	data = bytes.TrimSpace(data)
+	if len(data) == 0 {
 		return nil, nil
 	}
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(f); err != nil {
-		return nil, err
-	}
-	trim := strings.TrimSpace(buf.String())
-	if trim == "" {
-		return nil, nil
-	}
+	
 	var st CritState
-	if err := json.Unmarshal([]byte(trim), &st); err != nil {
+	if err := json.Unmarshal(data, &st); err != nil {
 		return nil, nil
 	}
 	return &st, nil
 }
 
 func writeState(path string, st *CritState) error {
-	f, err := os.Create(path)
+	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	return enc.Encode(st)
+	return os.WriteFile(path, data, 0o644)
 }
 
 // ----- Locking -----
@@ -256,16 +246,15 @@ func isFresh(st *CritState) bool {
 }
 
 func stateMatches(st *CritState, repo, repoDir string) bool {
-	if (st.Repo == nil && repo != "") || (st.Repo != nil && *st.Repo != repo) {
+	if (st.Repo == nil) != (repo == "") || (st.Repo != nil && *st.Repo != repo) {
 		return false
 	}
-	expanded := repoDir
-	if expanded != "" {
-		expanded = expandUser(expanded)
-	}
-	if (st.RepoDir == nil && expanded != "") || (st.RepoDir != nil && *st.RepoDir != expanded) {
+	
+	expanded := expandUser(repoDir)
+	if (st.RepoDir == nil) != (expanded == "") || (st.RepoDir != nil && *st.RepoDir != expanded) {
 		return false
 	}
+	
 	return true
 }
 
@@ -315,64 +304,83 @@ func render(st *CritState, style string) {
 	case "none":
 		return
 	case "full":
-		fmt.Println("Reviews requested:")
-		for _, pr := range st.PullRequests {
-			line := formatPRLine(pr)
-			if pr.IsOverdue {
-				line = "\x1b[31m" + line + "\x1b[0m"
-			}
-			fmt.Println(line)
-		}
-		fmt.Println()
-		fmt.Println("Your open PRs:")
-		for _, apr := range st.AuthoredPullRequests {
-			line := formatAuthoredLine(apr)
-			if apr.IsOverdueAge {
-				line = "\x1b[31m" + line + "\x1b[0m"
-			} else if apr.IsWarningAge {
-				line = "\x1b[33m" + line + "\x1b[0m"
-			}
-			fmt.Println(line)
-		}
-		fmt.Printf("(fetched %s ago)\n", formatRelativeAge(st.GeneratedAt))
-		return
+		renderFull(st)
 	case "prompt":
-		// count actionable reviews (non-draft)
-		reviewCount := 0
-		reviewStale := false
-		for _, pr := range st.PullRequests {
-			if !pr.IsDraft {
-				reviewCount++
-				if pr.IsOverdue {
-					reviewStale = true
-				}
-			}
-		}
-		authoredCount := len(st.AuthoredPullRequests)
-		authoredRed := false
-		authoredOrange := false
-		for _, apr := range st.AuthoredPullRequests {
-			if apr.IsOverdueAge {
-				authoredRed = true
-			} else if apr.IsWarningAge {
-				authoredOrange = true
-			}
-		}
-		if reviewCount == 0 && authoredCount == 0 {
-			return
-		}
-		left := fmt.Sprintf("%d", reviewCount)
-		if reviewStale && reviewCount > 0 {
-			left = "\x1b[31m" + left + "\x1b[0m"
-		}
-		right := fmt.Sprintf("%d", authoredCount)
-		if authoredRed && authoredCount > 0 {
-			right = "\x1b[31m" + right + "\x1b[0m"
-		} else if authoredOrange && authoredCount > 0 {
-			right = "\x1b[33m" + right + "\x1b[0m"
-		}
-		fmt.Print(left + "|" + right)
+		renderPrompt(st)
 	}
+}
+
+func renderFull(st *CritState) {
+	fmt.Println("Reviews requested:")
+	for _, pr := range st.PullRequests {
+		line := formatPRLine(pr)
+		if pr.IsOverdue {
+			line = "\x1b[31m" + line + "\x1b[0m"
+		}
+		fmt.Println(line)
+	}
+	
+	fmt.Println()
+	fmt.Println("Your open PRs:")
+	for _, apr := range st.AuthoredPullRequests {
+		line := formatAuthoredLine(apr)
+		if apr.IsOverdueAge {
+			line = "\x1b[31m" + line + "\x1b[0m"
+		} else if apr.IsWarningAge {
+			line = "\x1b[33m" + line + "\x1b[0m"
+		}
+		fmt.Println(line)
+	}
+	
+	fmt.Printf("(fetched %s ago)\n", formatRelativeAge(st.GeneratedAt))
+}
+
+func renderPrompt(st *CritState) {
+	reviewCount, reviewStale := countReviews(st.PullRequests)
+	authoredCount, authoredRed, authoredOrange := countAuthored(st.AuthoredPullRequests)
+	
+	if reviewCount == 0 && authoredCount == 0 {
+		return
+	}
+	
+	left := formatCount(reviewCount, reviewStale && reviewCount > 0, false)
+	right := formatCount(authoredCount, authoredRed && authoredCount > 0, authoredOrange && authoredCount > 0)
+	fmt.Print(left + "|" + right)
+}
+
+func countReviews(prs []PullRequestState) (count int, hasStale bool) {
+	for _, pr := range prs {
+		if !pr.IsDraft {
+			count++
+			if pr.IsOverdue {
+				hasStale = true
+			}
+		}
+	}
+	return
+}
+
+func countAuthored(prs []AuthoredPullRequestState) (count int, hasRed, hasOrange bool) {
+	count = len(prs)
+	for _, pr := range prs {
+		if pr.IsOverdueAge {
+			hasRed = true
+		} else if pr.IsWarningAge {
+			hasOrange = true
+		}
+	}
+	return
+}
+
+func formatCount(count int, red, orange bool) string {
+	s := fmt.Sprintf("%d", count)
+	if red {
+		return "\x1b[31m" + s + "\x1b[0m"
+	}
+	if orange {
+		return "\x1b[33m" + s + "\x1b[0m"
+	}
+	return s
 }
 
 func buildState(repo, repoDir string) (*CritState, error) {
@@ -444,11 +452,10 @@ func buildState(repo, repoDir string) (*CritState, error) {
 		authoredStates = append(authoredStates, state)
 	}
 
-	var repoPtr *string
+	var repoPtr, dirPtr *string
 	if repo != "" {
 		repoPtr = &repo
 	}
-	var dirPtr *string
 	if repoDir != "" {
 		exp := expandUser(repoDir)
 		dirPtr = &exp
@@ -465,12 +472,12 @@ func buildState(repo, repoDir string) (*CritState, error) {
 }
 
 func spawnBackgroundRefresh(flags Flags) {
-	// Call the same executable in background with --force-fetch --style none and same scope
 	exe, err := os.Executable()
 	if err != nil || exe == "" {
 		return
 	}
-	args := []string{}
+	
+	var args []string
 	if flags.repo != "" {
 		args = append(args, flags.repo)
 	}
@@ -478,6 +485,7 @@ func spawnBackgroundRefresh(flags Flags) {
 		args = append(args, "--repo-dir", flags.repoDir)
 	}
 	args = append(args, "--state", flags.statePath, "--force-fetch", "--style", "none")
+	
 	cmd := exec.Command(exe, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -520,8 +528,9 @@ func execute(flags Flags) int {
 
 	// Acquire lock
 	lockPath := flags.statePath + ".lock"
-	if l, ok, _ := tryLock(lockPath); !ok {
-		// wait
+	l, ok, _ := tryLock(lockPath)
+	if !ok {
+		// wait for lock
 		bl, err := lockBlocking(lockPath)
 		if err == nil && bl != nil {
 			// re-check freshness under lock
@@ -532,10 +541,8 @@ func execute(flags Flags) int {
 			}
 			l = bl
 		}
-		defer l.Unlock()
-	} else {
-		defer l.Unlock()
 	}
+	defer l.Unlock()
 
 	// Build and write state
 	st, err := buildState(flags.repo, flags.repoDir)
@@ -548,21 +555,34 @@ func execute(flags Flags) int {
 
 func parseFlags() Flags {
 	var f Flags
-	stateDefault := defaultStatePath()
 	flag.StringVar(&f.repoDir, "repo-dir", "", "Path to local git repo (sets gh working directory)")
-	flag.StringVar(&f.statePath, "state", stateDefault, "Path to state file")
+	flag.StringVar(&f.statePath, "state", defaultStatePath(), "Path to state file")
 	flag.BoolVar(&f.forceFetch, "force-fetch", false, "Force fetching even if cached state is fresh")
 	flag.BoolVar(&f.renderOnly, "render-only", false, "Only render cached state; do not fetch")
 	flag.StringVar(&f.style, "style", "full", "Output style: full|prompt|none")
 	flag.BoolVar(&f.quick, "quick", false, "Render stale cache immediately and refresh in background")
 	flag.Parse()
-	args := flag.Args()
-	if len(args) > 0 {
+	
+	if args := flag.Args(); len(args) > 0 {
 		f.repo = args[0]
 	}
-	// Expand state path and repo-dir
+	
 	f.statePath = expandUser(f.statePath)
-	f.repoDir = expandUser(f.repoDir)
+	
+	// If repo-dir wasn't specified, try to get it from persisted state
+	if f.repoDir == "" {
+		if st, _ := readState(f.statePath); st != nil && st.RepoDir != nil {
+			f.repoDir = *st.RepoDir
+		} else {
+			// No persisted repo-dir found, require it as a flag
+			fmt.Fprintf(os.Stderr, "Error: --repo-dir is required when no previous state exists\n")
+			flag.Usage()
+			os.Exit(1)
+		}
+	} else {
+		f.repoDir = expandUser(f.repoDir)
+	}
+	
 	return f
 }
 

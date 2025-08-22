@@ -1,4 +1,4 @@
-module github.com/kcons/gcrit
+module github.com/kcons/crit
 
 go 1.24.2
 
