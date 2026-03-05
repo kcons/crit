@@ -52,6 +52,7 @@ type AuthoredPullRequestState struct {
 
 type CritState struct {
 	GeneratedAt          time.Time                  `json:"generated_at"`
+	FetchDuration        time.Duration              `json:"fetch_duration,omitempty"`
 	Username             string                     `json:"username"`
 	Repo                 *string                    `json:"repo"`
 	RepoDir              *string                    `json:"repo_dir"`
@@ -308,6 +309,8 @@ func render(st *CritState, style string) {
 		renderFull(st)
 	case "prompt":
 		renderPrompt(st)
+	case "log":
+		renderLog(st)
 	}
 }
 
@@ -378,6 +381,38 @@ func formatPromptString(st *CritState, useColors bool) string {
 
 func renderPrompt(st *CritState) {
 	fmt.Print(formatPromptString(st, true))
+}
+
+func renderLog(st *CritState) {
+	reviewCount, reviewStale := countReviews(st.PullRequests)
+	authoredCount, _, _ := countAuthored(st.AuthoredPullRequests)
+	staleTag := ""
+	if reviewStale {
+		staleTag = " STALE"
+	}
+	fmt.Printf("%s fetch=%s reviews=%d authored=%d drafts=%d%s\n",
+		st.GeneratedAt.Format(time.RFC3339),
+		st.FetchDuration.Round(time.Millisecond),
+		reviewCount,
+		authoredCount,
+		countDrafts(st),
+		staleTag,
+	)
+}
+
+func countDrafts(st *CritState) int {
+	n := 0
+	for _, pr := range st.PullRequests {
+		if pr.IsDraft {
+			n++
+		}
+	}
+	for _, pr := range st.AuthoredPullRequests {
+		if pr.IsDraft {
+			n++
+		}
+	}
+	return n
 }
 
 func countReviews(prs []PullRequestState) (count int, hasStale bool) {
@@ -546,7 +581,7 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 		<string>{{.StatePath}}</string>
 		<string>--force-fetch</string>
 		<string>--style</string>
-		<string>none</string>
+		<string>log</string>
 	</array>
 	<key>StartInterval</key>
 	<integer>300</integer>
@@ -730,8 +765,10 @@ func execute(flags Flags) int {
 	defer l.Unlock()
 
 	// Build and write state
+	fetchStart := time.Now()
 	st, err := buildState(flags.repo, flags.repoDir)
 	if err == nil {
+		st.FetchDuration = time.Since(fetchStart)
 		_ = writeState(flags.statePath, st)
 		render(st, flags.style)
 	}
@@ -781,11 +818,55 @@ func handleServiceCommand(subcommand string) int {
 		}
 		return 0
 		
+	case "log":
+		if err := showServiceLog(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error showing service log: %v\n", err)
+			return 1
+		}
+		return 0
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown service subcommand: %s\n", subcommand)
-		fmt.Fprintf(os.Stderr, "Usage: crit service <install|remove|status>\n")
+		fmt.Fprintf(os.Stderr, "Usage: crit service <install|remove|status|log>\n")
 		return 1
 	}
+}
+
+func showServiceLog() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+	processName := filepath.Base(exe)
+
+	pager := os.Getenv("PAGER")
+	if pager == "" {
+		pager = "less"
+	}
+
+	logCmd := exec.Command("log", "show", "--process", processName, "--last", "1d", "--style", "compact")
+	pagerCmd := exec.Command(pager)
+
+	pipe, err := logCmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create pipe: %w", err)
+	}
+	pagerCmd.Stdin = pipe
+	pagerCmd.Stdout = os.Stdout
+	pagerCmd.Stderr = os.Stderr
+
+	if err := logCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start log command: %w", err)
+	}
+	if err := pagerCmd.Start(); err != nil {
+		return fmt.Errorf("failed to start pager: %w", err)
+	}
+
+	// If pager exits early (user quits), kill the log process
+	_ = pagerCmd.Wait()
+	_ = logCmd.Process.Kill()
+	_ = logCmd.Wait()
+	return nil
 }
 
 func parseFlags() Flags {
@@ -794,7 +875,7 @@ func parseFlags() Flags {
 	flag.StringVar(&f.statePath, "state", defaultStatePath(), "Path to state file")
 	flag.BoolVar(&f.forceFetch, "force-fetch", false, "Force fetching even if cached state is fresh")
 	flag.BoolVar(&f.renderOnly, "render-only", false, "Only render cached state; do not fetch")
-	flag.StringVar(&f.style, "style", "full", "Output style: full|prompt|none")
+	flag.StringVar(&f.style, "style", "full", "Output style: full|prompt|log|none")
 	flag.BoolVar(&f.quick, "quick", false, "Render stale cache immediately and refresh in background")
 	flag.Parse()
 	
@@ -836,13 +917,14 @@ Options (for default command):
   --state <path>      Path to state file (default: ~/.crit_state.json)
   --force-fetch       Force fetching even if cached state is fresh
   --render-only       Only render cached state; do not fetch
-  --style <style>     Output style: full|prompt|none (default: full)
+  --style <style>     Output style: full|prompt|log|none (default: full)
   --quick             Render stale cache immediately and refresh in background
 
 Service subcommands:
   %[1]s service install [repo] [--repo-dir <path>] [--state <path>]
   %[1]s service remove
   %[1]s service status
+  %[1]s service log
 `, cmd)
 }
 
@@ -851,7 +933,7 @@ func main() {
 		switch os.Args[1] {
 		case "service":
 			if len(os.Args) < 3 {
-				fmt.Fprintf(os.Stderr, "Usage: gcrit service <install|remove|status>\n")
+				fmt.Fprintf(os.Stderr, "Usage: gcrit service <install|remove|status|log>\n")
 				os.Exit(1)
 			}
 			os.Exit(handleServiceCommand(os.Args[2]))
