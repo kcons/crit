@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"text/template"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -523,6 +524,159 @@ func spawnBackgroundRefresh(flags Flags) {
 	_ = cmd.Start()
 }
 
+// ----- Launchd service installation -----
+
+const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.crit</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{{.Executable}}</string>
+		{{- if .Repo}}
+		<string>{{.Repo}}</string>
+		{{- end}}
+		{{- if .RepoDir}}
+		<string>--repo-dir</string>
+		<string>{{.RepoDir}}</string>
+		{{- end}}
+		<string>--state</string>
+		<string>{{.StatePath}}</string>
+		<string>--force-fetch</string>
+		<string>--style</string>
+		<string>none</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+</dict>
+</plist>`
+
+type PlistData struct {
+	Executable string
+	Repo       string
+	RepoDir    string
+	StatePath  string
+}
+
+func getPlistPath() string {
+	homeDir := mustUserHomeDir()
+	return filepath.Join(homeDir, "Library/LaunchAgents/com.user.crit.plist")
+}
+
+func installLaunchdService(flags Flags) error {
+	plistPath := getPlistPath()
+	
+	// Check if service is already installed
+	if _, err := os.Stat(plistPath); err == nil {
+		// Check if it's also loaded
+		cmd := exec.Command("launchctl", "list", "com.user.crit")
+		if cmd.Run() == nil {
+			fmt.Println("Service is already installed and loaded.")
+			return nil
+		} else {
+			fmt.Println("Service is installed but not loaded. Loading...")
+			loadCmd := exec.Command("launchctl", "load", plistPath)
+			if err := loadCmd.Run(); err != nil {
+				return fmt.Errorf("failed to load existing service: %w", err)
+			}
+			fmt.Println("Successfully loaded existing service.")
+			return nil
+		}
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to get executable path: %w", err)
+	}
+
+	launchAgentsDir := filepath.Dir(plistPath)
+
+	if err := os.MkdirAll(launchAgentsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create LaunchAgents directory: %w", err)
+	}
+
+	tmpl, err := template.New("plist").Parse(launchdPlistTemplate)
+	if err != nil {
+		return fmt.Errorf("failed to parse plist template: %w", err)
+	}
+
+	data := PlistData{
+		Executable: exe,
+		Repo:       flags.repo,
+		RepoDir:    flags.repoDir,
+		StatePath:  flags.statePath,
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, data); err != nil {
+		return fmt.Errorf("failed to execute plist template: %w", err)
+	}
+
+	if err := os.WriteFile(plistPath, buf.Bytes(), 0644); err != nil {
+		return fmt.Errorf("failed to write plist file: %w", err)
+	}
+
+	cmd := exec.Command("launchctl", "load", plistPath)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("failed to load launchd service: %w", err)
+	}
+
+	fmt.Printf("Successfully installed and loaded launchd service at %s\n", plistPath)
+	fmt.Println("The service will run every 5 minutes to update crit state.")
+	return nil
+}
+
+func removeLaunchdService() error {
+	plistPath := getPlistPath()
+	
+	// Try to unload the service first
+	cmd := exec.Command("launchctl", "unload", plistPath)
+	_ = cmd.Run() // Ignore error if service wasn't loaded
+	
+	// Remove the plist file
+	if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove plist file: %w", err)
+	}
+	
+	fmt.Println("Successfully removed launchd service.")
+	return nil
+}
+
+func statusLaunchdService() error {
+	plistPath := getPlistPath()
+	
+	// Check if plist file exists
+	if _, err := os.Stat(plistPath); os.IsNotExist(err) {
+		fmt.Println("Service is not installed.")
+		return nil
+	}
+	
+	// Check if service is loaded
+	cmd := exec.Command("launchctl", "list", "com.user.crit")
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Service is installed but not loaded.")
+		return nil
+	}
+	
+	fmt.Printf("Service is installed and loaded.\nPlist path: %s\n", plistPath)
+	
+	// Parse launchctl list output to show basic status
+	lines := strings.Split(string(output), "\n")
+	if len(lines) > 0 && lines[0] != "" {
+		parts := strings.Fields(lines[0])
+		if len(parts) >= 3 {
+			fmt.Printf("Status: PID=%s, Exit Code=%s, Label=%s\n", parts[0], parts[1], parts[2])
+		}
+	}
+	
+	return nil
+}
+
 func execute(flags Flags) int {
 	// Render-only path
 	if flags.renderOnly {
@@ -584,6 +738,56 @@ func execute(flags Flags) int {
 	return 0
 }
 
+func handleServiceCommand(subcommand string) int {
+	switch subcommand {
+	case "install":
+		// Parse flags for install subcommand
+		installCmd := flag.NewFlagSet("install", flag.ExitOnError)
+		var flags Flags
+		installCmd.StringVar(&flags.repoDir, "repo-dir", "", "Path to local git repo (sets gh working directory)")
+		installCmd.StringVar(&flags.statePath, "state", defaultStatePath(), "Path to state file")
+		
+		// Manually parse to handle repo argument before flags
+		args := os.Args[3:]
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			flags.repo = args[0]
+			args = args[1:]
+		}
+		
+		installCmd.Parse(args)
+		
+		flags.statePath = expandUser(flags.statePath)
+		if flags.repoDir != "" {
+			flags.repoDir = expandUser(flags.repoDir)
+		}
+		
+		if err := installLaunchdService(flags); err != nil {
+			fmt.Fprintf(os.Stderr, "Error installing service: %v\n", err)
+			return 1
+		}
+		return 0
+		
+	case "remove":
+		if err := removeLaunchdService(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error removing service: %v\n", err)
+			return 1
+		}
+		return 0
+		
+	case "status":
+		if err := statusLaunchdService(); err != nil {
+			fmt.Fprintf(os.Stderr, "Error checking service status: %v\n", err)
+			return 1
+		}
+		return 0
+		
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown service subcommand: %s\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Usage: crit service <install|remove|status>\n")
+		return 1
+	}
+}
+
 func parseFlags() Flags {
 	var f Flags
 	flag.StringVar(&f.repoDir, "repo-dir", "", "Path to local git repo (sets gh working directory)")
@@ -618,6 +822,16 @@ func parseFlags() Flags {
 }
 
 func main() {
+	// Check for service subcommand first - do this before anything else
+	// to avoid showing PR status during service operations
+	if len(os.Args) > 1 && os.Args[1] == "service" {
+		if len(os.Args) < 3 {
+			fmt.Fprintf(os.Stderr, "Usage: crit service <install|remove|status>\n")
+			os.Exit(1)
+		}
+		os.Exit(handleServiceCommand(os.Args[2]))
+	}
+	
 	f := parseFlags()
 	os.Exit(execute(f))
 }
