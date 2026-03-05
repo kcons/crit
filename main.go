@@ -821,17 +821,55 @@ func parseFlags() Flags {
 	return f
 }
 
+func printUsage() {
+	cmd := filepath.Base(os.Args[0])
+	fmt.Fprintf(os.Stderr, `Usage: %[1]s [command] [options]
+
+Commands:
+  (default)    Fetch and display PR review status
+  service      Manage the background launchd service
+  help         Show this help message
+
+Options (for default command):
+  [repo]              GitHub repo (e.g. owner/repo) as positional argument
+  --repo-dir <path>   Path to local git repo (sets gh working directory)
+  --state <path>      Path to state file (default: ~/.crit_state.json)
+  --force-fetch       Force fetching even if cached state is fresh
+  --render-only       Only render cached state; do not fetch
+  --style <style>     Output style: full|prompt|none (default: full)
+  --quick             Render stale cache immediately and refresh in background
+
+Service subcommands:
+  %[1]s service install [repo] [--repo-dir <path>] [--state <path>]
+  %[1]s service remove
+  %[1]s service status
+`, cmd)
+}
+
 func main() {
-	// Check for service subcommand first - do this before anything else
-	// to avoid showing PR status during service operations
-	if len(os.Args) > 1 && os.Args[1] == "service" {
-		if len(os.Args) < 3 {
-			fmt.Fprintf(os.Stderr, "Usage: crit service <install|remove|status>\n")
-			os.Exit(1)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "service":
+			if len(os.Args) < 3 {
+				fmt.Fprintf(os.Stderr, "Usage: gcrit service <install|remove|status>\n")
+				os.Exit(1)
+			}
+			os.Exit(handleServiceCommand(os.Args[2]))
+		case "help", "--help", "-h":
+			printUsage()
+			os.Exit(0)
+		default:
+			// If the first arg doesn't start with "-", it could be either
+			// a repo name or an unknown command. Repo names contain "/".
+			arg := os.Args[1]
+			if !strings.HasPrefix(arg, "-") && !strings.Contains(arg, "/") {
+				fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", arg)
+				printUsage()
+				os.Exit(1)
+			}
 		}
-		os.Exit(handleServiceCommand(os.Args[2]))
 	}
-	
+
 	f := parseFlags()
 	os.Exit(execute(f))
 }
