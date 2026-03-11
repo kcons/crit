@@ -16,6 +16,8 @@ import (
 	"text/template"
 	"time"
 
+	"sort"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -42,12 +44,17 @@ type PullRequestState struct {
 }
 
 type AuthoredPullRequestState struct {
-	Title        string     `json:"title"`
-	URL          string     `json:"url"`
-	IsDraft      bool       `json:"isDraft"`
-	CreatedAt    *time.Time `json:"createdAt,omitempty"`
-	IsWarningAge bool       `json:"isWarningAge"`
-	IsOverdueAge bool       `json:"isOverdueAge"`
+	Title         string     `json:"title"`
+	URL           string     `json:"url"`
+	IsDraft       bool       `json:"isDraft"`
+	CreatedAt     *time.Time `json:"createdAt,omitempty"`
+	UpdatedAt     *time.Time `json:"updatedAt,omitempty"`
+	IsWarningAge  bool       `json:"isWarningAge"`
+	IsOverdueAge  bool       `json:"isOverdueAge"`
+	NeedsResponse bool       `json:"needsResponse"`
+	IsApproved    bool       `json:"isApproved"`
+	ChecksPassed  bool       `json:"checksPassed"`
+	HasConflict   bool       `json:"hasConflict"`
 }
 
 type CritState struct {
@@ -66,13 +73,23 @@ type ghUser struct {
 	Login string `json:"login"`
 }
 
+type ghCheckRun struct {
+	TypeName   string `json:"__typename"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	State      string `json:"state"` // StatusContext uses state instead of status/conclusion
+}
+
 type ghPR struct {
-	Title          string   `json:"title"`
-	URL            string   `json:"url"`
-	IsDraft        bool     `json:"isDraft"`
-	UpdatedAt      *string  `json:"updatedAt"`
-	CreatedAt      *string  `json:"createdAt"`
-	ReviewRequests []ghUser `json:"reviewRequests"`
+	Title              string       `json:"title"`
+	URL                string       `json:"url"`
+	IsDraft            bool         `json:"isDraft"`
+	UpdatedAt          *string      `json:"updatedAt"`
+	CreatedAt          *string      `json:"createdAt"`
+	ReviewRequests     []ghUser     `json:"reviewRequests"`
+	ReviewDecision     string       `json:"reviewDecision"`
+	StatusCheckRollup  []ghCheckRun `json:"statusCheckRollup"`
+	Mergeable          string       `json:"mergeable"`
 }
 
 // ----- Helpers -----
@@ -149,7 +166,7 @@ func fetchReviewRequested(repo, repoDir string) ([]ghPR, error) {
 }
 
 func fetchAuthored(repo, repoDir string) ([]ghPR, error) {
-	args := []string{"pr", "list", "--search", "author:@me", "--json", "title,url,isDraft,createdAt"}
+	args := []string{"pr", "list", "--search", "author:@me", "--json", "title,url,isDraft,createdAt,updatedAt,reviewDecision,statusCheckRollup,mergeable"}
 	if repo != "" {
 		args = append(args, "--repo", repo)
 	}
@@ -269,15 +286,22 @@ func formatPRLine(pr PullRequestState) string {
 	if pr.IsDraft {
 		prefix = "[DRAFT] "
 	}
-	return fmt.Sprintf("%s%s - %s", prefix, pr.Title, makeLink(pr.URL, pr.URL))
+	return fmt.Sprintf("%s%s\n    %s", prefix, pr.Title, makeLink(pr.URL, pr.URL))
 }
 
 func formatAuthoredLine(pr AuthoredPullRequestState) string {
 	prefix := ""
-	if pr.IsDraft {
-		prefix = "[DRAFT] "
+	if pr.HasConflict {
+		prefix = "\u274C "
+	} else if pr.NeedsResponse {
+		prefix = "\u2757"
+	} else if !pr.IsDraft && pr.IsApproved && pr.ChecksPassed {
+		prefix = "\U0001F6A2 "
 	}
-	return fmt.Sprintf("%s%s - %s", prefix, pr.Title, makeLink(pr.URL, pr.URL))
+	if pr.IsDraft {
+		prefix += "[DRAFT] "
+	}
+	return fmt.Sprintf("%s%s\n    %s", prefix, pr.Title, makeLink(pr.URL, pr.URL))
 }
 
 func formatRelativeAge(when time.Time) string {
@@ -314,17 +338,73 @@ func render(st *CritState, style string) {
 	}
 }
 
-func renderFull(st *CritState) {
-	fmt.Println("Reviews requested:")
-	for _, pr := range st.PullRequests {
-		line := formatPRLine(pr)
-		if pr.IsOverdue {
-			line = "\x1b[31m" + line + "\x1b[0m"
-		}
-		fmt.Println(line)
+func reviewPROrder(pr PullRequestState) int {
+	// overdue non-draft=0, non-draft=1, overdue draft=2, draft=3
+	base := 0
+	if !pr.IsOverdue {
+		base = 1
 	}
-	
-	fmt.Println()
+	if pr.IsDraft {
+		base += 2
+	}
+	return base
+}
+
+func authoredPROrder(pr AuthoredPullRequestState) int {
+	// color group: overdue=0, warning=1, normal=2; draft adds 3
+	base := 2
+	if pr.IsOverdueAge {
+		base = 0
+	} else if pr.IsWarningAge {
+		base = 1
+	}
+	if pr.IsDraft {
+		base += 3
+	}
+	return base
+}
+
+func updatedAtDesc(a, b *time.Time) bool {
+	if a == nil && b == nil {
+		return false
+	}
+	if a == nil {
+		return false
+	}
+	if b == nil {
+		return true
+	}
+	return a.After(*b)
+}
+
+func renderFull(st *CritState) {
+	sort.Slice(st.PullRequests, func(i, j int) bool {
+		oi, oj := reviewPROrder(st.PullRequests[i]), reviewPROrder(st.PullRequests[j])
+		if oi != oj {
+			return oi < oj
+		}
+		return updatedAtDesc(st.PullRequests[i].UpdatedAt, st.PullRequests[j].UpdatedAt)
+	})
+	sort.Slice(st.AuthoredPullRequests, func(i, j int) bool {
+		oi, oj := authoredPROrder(st.AuthoredPullRequests[i]), authoredPROrder(st.AuthoredPullRequests[j])
+		if oi != oj {
+			return oi < oj
+		}
+		return updatedAtDesc(st.AuthoredPullRequests[i].UpdatedAt, st.AuthoredPullRequests[j].UpdatedAt)
+	})
+
+	if len(st.PullRequests) > 0 {
+		fmt.Println("Reviews requested:")
+		for _, pr := range st.PullRequests {
+			line := formatPRLine(pr)
+			if pr.IsOverdue {
+				line = "\x1b[31m" + line + "\x1b[0m"
+			}
+			fmt.Println(line)
+		}
+		fmt.Println()
+	}
+
 	fmt.Println("Your open PRs:")
 	for _, apr := range st.AuthoredPullRequests {
 		line := formatAuthoredLine(apr)
@@ -335,13 +415,13 @@ func renderFull(st *CritState) {
 		}
 		fmt.Println(line)
 	}
-	
+
 	fmt.Printf("(fetched %s ago)\n", formatRelativeAge(st.GeneratedAt))
 }
 
 func formatPromptString(st *CritState, useColors bool) string {
 	reviewCount, reviewStale := countReviews(st.PullRequests)
-	authoredCount, authoredRed, authoredOrange := countAuthored(st.AuthoredPullRequests)
+	authoredCount, authoredRed, authoredOrange, authoredNeedsResponse := countAuthored(st.AuthoredPullRequests)
 	
 	if reviewCount == 0 && authoredCount == 0 {
 		return "👍"
@@ -366,9 +446,12 @@ func formatPromptString(st *CritState, useColors bool) string {
 		} else {
 			countStr = fmt.Sprintf("%d", authoredCount)
 		}
+		if authoredNeedsResponse {
+			countStr += "\u2757"
+		}
 		parts = append(parts, "🚢"+countStr)
 	}
-	
+
 	if len(parts) == 1 {
 		return parts[0]
 	}
@@ -385,7 +468,7 @@ func renderPrompt(st *CritState) {
 
 func renderLog(st *CritState) {
 	reviewCount, reviewStale := countReviews(st.PullRequests)
-	authoredCount, _, _ := countAuthored(st.AuthoredPullRequests)
+	authoredCount, _, _, _ := countAuthored(st.AuthoredPullRequests)
 	staleTag := ""
 	if reviewStale {
 		staleTag = " STALE"
@@ -427,13 +510,16 @@ func countReviews(prs []PullRequestState) (count int, hasStale bool) {
 	return
 }
 
-func countAuthored(prs []AuthoredPullRequestState) (count int, hasRed, hasOrange bool) {
+func countAuthored(prs []AuthoredPullRequestState) (count int, hasRed, hasOrange, hasNeedsResponse bool) {
 	count = len(prs)
 	for _, pr := range prs {
 		if pr.IsOverdueAge {
 			hasRed = true
 		} else if pr.IsWarningAge {
 			hasOrange = true
+		}
+		if pr.NeedsResponse {
+			hasNeedsResponse = true
 		}
 	}
 	return
@@ -448,6 +534,124 @@ func formatCount(count int, red, orange bool) string {
 		return "\x1b[33m" + s + "\x1b[0m"
 	}
 	return s
+}
+
+// resolveRepoName returns the "owner/name" for the repo, either from the flag or by querying gh.
+func resolveRepoName(repo, repoDir string) (string, error) {
+	if repo != "" {
+		return repo, nil
+	}
+	out, err := runGH(repoDir, "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// fetchNeedsResponse uses the GraphQL API to check review threads for authored PRs.
+// Returns a set of PR URLs that have unresolved threads where the last comment is not from username.
+func fetchNeedsResponse(repo, repoDir, username string) (map[string]bool, error) {
+	repoName, err := resolveRepoName(repo, repoDir)
+	if err != nil {
+		return nil, err
+	}
+
+	query := fmt.Sprintf("repo:%s is:pr is:open author:%s", repoName, username)
+	gqlQuery := `query($q: String!) {
+		search(query: $q, type: ISSUE, first: 30) {
+			nodes {
+				... on PullRequest {
+					url
+					reviewThreads(first: 100) {
+						nodes {
+							isResolved
+							comments(last: 1) {
+								nodes {
+									author { login }
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}`
+
+	out, err := runGH(repoDir, "api", "graphql", "-f", "query="+gqlQuery, "-f", "q="+query)
+	if err != nil {
+		return nil, err
+	}
+
+	var result struct {
+		Data struct {
+			Search struct {
+				Nodes []struct {
+					URL           string `json:"url"`
+					ReviewThreads struct {
+						Nodes []reviewThread `json:"nodes"`
+					} `json:"reviewThreads"`
+				} `json:"nodes"`
+			} `json:"search"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		return nil, err
+	}
+
+	needs := make(map[string]bool)
+	for _, pr := range result.Data.Search.Nodes {
+		if hasUnresolvedThreadFromOthers(pr.ReviewThreads.Nodes, username) {
+			needs[pr.URL] = true
+		}
+	}
+	return needs, nil
+}
+
+type reviewThread struct {
+	IsResolved bool `json:"isResolved"`
+	Comments   struct {
+		Nodes []struct {
+			Author struct {
+				Login string `json:"login"`
+			} `json:"author"`
+		} `json:"nodes"`
+	} `json:"comments"`
+}
+
+// hasUnresolvedThreadFromOthers returns true if any unresolved review thread
+// has a last comment from someone other than username.
+func hasUnresolvedThreadFromOthers(threads []reviewThread, username string) bool {
+	for _, thread := range threads {
+		if thread.IsResolved {
+			continue
+		}
+		comments := thread.Comments.Nodes
+		if len(comments) > 0 && comments[0].Author.Login != username {
+			return true
+		}
+	}
+	return false
+}
+
+func allChecksPassed(checks []ghCheckRun) bool {
+	if len(checks) == 0 {
+		return false
+	}
+	for _, c := range checks {
+		if c.TypeName == "StatusContext" {
+			if c.State != "SUCCESS" {
+				return false
+			}
+		} else {
+			if c.Status != "COMPLETED" {
+				return false
+			}
+			if c.Conclusion != "SUCCESS" && c.Conclusion != "SKIPPED" && c.Conclusion != "NEUTRAL" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func buildState(repo, repoDir string) (*CritState, error) {
@@ -494,19 +698,33 @@ func buildState(repo, repoDir string) (*CritState, error) {
 	if err != nil {
 		return nil, err
 	}
+	needsResponse, _ := fetchNeedsResponse(repo, repoDir, username)
+	if needsResponse == nil {
+		needsResponse = make(map[string]bool)
+	}
 	var authoredStates []AuthoredPullRequestState
 	for _, pr := range authoredPRs {
-		var created *time.Time
+		var created, updated *time.Time
 		if pr.CreatedAt != nil && *pr.CreatedAt != "" {
 			if t, err := time.Parse(time.RFC3339, *pr.CreatedAt); err == nil {
 				created = &t
 			}
 		}
+		if pr.UpdatedAt != nil && *pr.UpdatedAt != "" {
+			if t, err := time.Parse(time.RFC3339, *pr.UpdatedAt); err == nil {
+				updated = &t
+			}
+		}
 		state := AuthoredPullRequestState{
-			Title:     pr.Title,
-			URL:       pr.URL,
-			IsDraft:   pr.IsDraft,
-			CreatedAt: created,
+			Title:         pr.Title,
+			URL:           pr.URL,
+			IsDraft:       pr.IsDraft,
+			CreatedAt:     created,
+			UpdatedAt:     updated,
+			NeedsResponse: needsResponse[pr.URL],
+			IsApproved:    pr.ReviewDecision == "APPROVED",
+			ChecksPassed:  allChecksPassed(pr.StatusCheckRollup),
+			HasConflict:   pr.Mergeable == "CONFLICTING",
 		}
 		if state.CreatedAt != nil {
 			age := now.Sub(*state.CreatedAt)
@@ -583,6 +801,10 @@ const launchdPlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
 		<string>--style</string>
 		<string>log</string>
 	</array>
+	<key>StandardOutPath</key>
+	<string>{{.LogPath}}</string>
+	<key>StandardErrorPath</key>
+	<string>{{.LogPath}}</string>
 	<key>StartInterval</key>
 	<integer>300</integer>
 	<key>RunAtLoad</key>
@@ -595,11 +817,15 @@ type PlistData struct {
 	Repo       string
 	RepoDir    string
 	StatePath  string
+	LogPath    string
 }
 
 func getPlistPath() string {
-	homeDir := mustUserHomeDir()
-	return filepath.Join(homeDir, "Library/LaunchAgents/com.user.crit.plist")
+	return filepath.Join(mustUserHomeDir(), "Library/LaunchAgents/com.user.crit.plist")
+}
+
+func getLogPath() string {
+	return filepath.Join(mustUserHomeDir(), "Library/Logs/crit.log")
 }
 
 func installLaunchdService(flags Flags) error {
@@ -644,6 +870,7 @@ func installLaunchdService(flags Flags) error {
 		Repo:       flags.repo,
 		RepoDir:    flags.repoDir,
 		StatePath:  flags.statePath,
+		LogPath:    getLogPath(),
 	}
 
 	var buf bytes.Buffer
@@ -833,40 +1060,22 @@ func handleServiceCommand(subcommand string) int {
 }
 
 func showServiceLog() error {
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("failed to get executable path: %w", err)
+	logPath := getLogPath()
+	if _, err := os.Stat(logPath); os.IsNotExist(err) {
+		fmt.Println("No log file found. Is the service installed?")
+		return nil
 	}
-	processName := filepath.Base(exe)
 
 	pager := os.Getenv("PAGER")
 	if pager == "" {
 		pager = "less"
 	}
 
-	logCmd := exec.Command("log", "show", "--process", processName, "--last", "1d", "--style", "compact")
-	pagerCmd := exec.Command(pager)
-
-	pipe, err := logCmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create pipe: %w", err)
-	}
-	pagerCmd.Stdin = pipe
-	pagerCmd.Stdout = os.Stdout
-	pagerCmd.Stderr = os.Stderr
-
-	if err := logCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start log command: %w", err)
-	}
-	if err := pagerCmd.Start(); err != nil {
-		return fmt.Errorf("failed to start pager: %w", err)
-	}
-
-	// If pager exits early (user quits), kill the log process
-	_ = pagerCmd.Wait()
-	_ = logCmd.Process.Kill()
-	_ = logCmd.Wait()
-	return nil
+	cmd := exec.Command(pager, "+G", logPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	return cmd.Run()
 }
 
 func parseFlags() Flags {

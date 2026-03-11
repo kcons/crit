@@ -278,3 +278,98 @@ func TestFormatPromptStringWithoutColors(t *testing.T) {
 		})
 	}
 }
+
+func makeThread(resolved bool, lastAuthor string) reviewThread {
+	var t reviewThread
+	t.IsResolved = resolved
+	t.Comments.Nodes = []struct {
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+	}{
+		{Author: struct {
+			Login string `json:"login"`
+		}{Login: lastAuthor}},
+	}
+	return t
+}
+
+func TestHasUnresolvedThreadFromOthers(t *testing.T) {
+	tests := []struct {
+		name     string
+		threads  []reviewThread
+		username string
+		want     bool
+	}{
+		{
+			name:     "no threads",
+			threads:  nil,
+			username: "me",
+			want:     false,
+		},
+		{
+			name:     "resolved thread from other",
+			threads:  []reviewThread{makeThread(true, "reviewer")},
+			username: "me",
+			want:     false,
+		},
+		{
+			name:     "unresolved thread last comment by self",
+			threads:  []reviewThread{makeThread(false, "me")},
+			username: "me",
+			want:     false,
+		},
+		{
+			name:     "unresolved thread last comment by other",
+			threads:  []reviewThread{makeThread(false, "reviewer")},
+			username: "me",
+			want:     true,
+		},
+		{
+			name: "mix of resolved and unresolved, only resolved from others",
+			threads: []reviewThread{
+				makeThread(true, "reviewer"),
+				makeThread(false, "me"),
+			},
+			username: "me",
+			want:     false,
+		},
+		{
+			name: "mix of resolved and unresolved, unresolved from other",
+			threads: []reviewThread{
+				makeThread(true, "me"),
+				makeThread(false, "reviewer"),
+			},
+			username: "me",
+			want:     true,
+		},
+		{
+			name: "multiple unresolved, one from other",
+			threads: []reviewThread{
+				makeThread(false, "me"),
+				makeThread(false, "me"),
+				makeThread(false, "reviewer"),
+			},
+			username: "me",
+			want:     true,
+		},
+		{
+			name: "multiple reviewers, all responded to",
+			threads: []reviewThread{
+				makeThread(false, "me"),
+				makeThread(false, "me"),
+			},
+			username: "me",
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasUnresolvedThreadFromOthers(tt.threads, tt.username)
+			if got != tt.want {
+				t.Errorf("hasUnresolvedThreadFromOthers() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
