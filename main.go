@@ -13,10 +13,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sort"
 	"text/template"
 	"time"
-
-	"sort"
 
 	"golang.org/x/sys/unix"
 )
@@ -275,6 +274,16 @@ func stateMatches(st *CritState, repo, repoDir string) bool {
 	}
 	
 	return true
+}
+
+func parseTimePtr(s *string) *time.Time {
+	if s == nil || *s == "" {
+		return nil
+	}
+	if t, err := time.Parse(time.RFC3339, *s); err == nil {
+		return &t
+	}
+	return nil
 }
 
 func makeLink(text, url string) string {
@@ -659,10 +668,51 @@ func buildState(repo, repoDir string) (*CritState, error) {
 	if err != nil || username == "" {
 		return nil, fmt.Errorf("unable to resolve username: %w", err)
 	}
-	reviewPRs, err := fetchReviewRequested(repo, repoDir)
-	if err != nil {
-		return nil, err
+	type reviewFetchResult struct {
+		prs []ghPR
+		err error
 	}
+	type authoredFetchResult struct {
+		prs []ghPR
+		err error
+	}
+	type needsResponseResult struct {
+		m map[string]bool
+	}
+
+	reviewCh := make(chan reviewFetchResult, 1)
+	authoredCh := make(chan authoredFetchResult, 1)
+	needsCh := make(chan needsResponseResult, 1)
+
+	go func() {
+		prs, err := fetchReviewRequested(repo, repoDir)
+		reviewCh <- reviewFetchResult{prs, err}
+	}()
+	go func() {
+		prs, err := fetchAuthored(repo, repoDir)
+		authoredCh <- authoredFetchResult{prs, err}
+	}()
+	go func() {
+		m, _ := fetchNeedsResponse(repo, repoDir, username)
+		if m == nil {
+			m = make(map[string]bool)
+		}
+		needsCh <- needsResponseResult{m}
+	}()
+
+	reviewRes := <-reviewCh
+	if reviewRes.err != nil {
+		return nil, reviewRes.err
+	}
+	authoredRes := <-authoredCh
+	if authoredRes.err != nil {
+		return nil, authoredRes.err
+	}
+	needsResponse := (<-needsCh).m
+
+	reviewPRs := reviewRes.prs
+	authoredPRs := authoredRes.prs
+
 	var reviewFiltered []PullRequestState
 	now := time.Now().UTC()
 	for _, pr := range reviewPRs {
@@ -676,12 +726,7 @@ func buildState(repo, repoDir string) (*CritState, error) {
 		if !isRequested {
 			continue
 		}
-		var updated *time.Time
-		if pr.UpdatedAt != nil && *pr.UpdatedAt != "" {
-			if t, err := time.Parse(time.RFC3339, *pr.UpdatedAt); err == nil {
-				updated = &t
-			}
-		}
+		updated := parseTimePtr(pr.UpdatedAt)
 		state := PullRequestState{
 			Title:     pr.Title,
 			URL:       pr.URL,
@@ -693,28 +738,10 @@ func buildState(repo, repoDir string) (*CritState, error) {
 		}
 		reviewFiltered = append(reviewFiltered, state)
 	}
-
-	authoredPRs, err := fetchAuthored(repo, repoDir)
-	if err != nil {
-		return nil, err
-	}
-	needsResponse, _ := fetchNeedsResponse(repo, repoDir, username)
-	if needsResponse == nil {
-		needsResponse = make(map[string]bool)
-	}
 	var authoredStates []AuthoredPullRequestState
 	for _, pr := range authoredPRs {
-		var created, updated *time.Time
-		if pr.CreatedAt != nil && *pr.CreatedAt != "" {
-			if t, err := time.Parse(time.RFC3339, *pr.CreatedAt); err == nil {
-				created = &t
-			}
-		}
-		if pr.UpdatedAt != nil && *pr.UpdatedAt != "" {
-			if t, err := time.Parse(time.RFC3339, *pr.UpdatedAt); err == nil {
-				updated = &t
-			}
-		}
+		created := parseTimePtr(pr.CreatedAt)
+		updated := parseTimePtr(pr.UpdatedAt)
 		state := AuthoredPullRequestState{
 			Title:         pr.Title,
 			URL:           pr.URL,
