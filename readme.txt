@@ -14,3 +14,39 @@ the substitution each time the prompt is displayed.
 For bash, add to your .bashrc:
 
     PROMPT_COMMAND='PS1="$(crit -quick -style prompt) \w \$ "'
+
+Claude Code status line
+-----------------------
+
+Claude Code supports a custom status line script that runs on each turn. To
+include crit output there, create ~/.claude/statusline.sh:
+
+    #!/bin/bash
+    input=$(cat)
+    model=$(echo "$input" | jq -r '.model.display_name')
+    current_dir=$(echo "$input" | jq -r '.workspace.current_dir')
+    remaining=$(echo "$input" | jq -r '.context_window.remaining_percentage // empty')
+    cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
+    cost=$(printf "%.2f" "$cost")
+    crit_output=$(crit --quick --style prompt 2>/dev/null || echo '')
+
+    status="$model | $current_dir"
+    [ -n "$remaining" ] && status="$status | Context: ${remaining}%"
+    [ "$cost" != "0.00" ] && status="$status | Cost: \$$cost"
+    [ -n "$crit_output" ] && status="$status | $crit_output"
+
+    printf "%s" "$status"
+
+Make it executable:
+
+    chmod +x ~/.claude/statusline.sh
+
+Then point Claude Code at it in ~/.claude/settings.json:
+
+    {
+      "statusCommand": "~/.claude/statusline.sh"
+    }
+
+The --quick flag is important here: it renders from the cached state file
+immediately (no blocking network call) and triggers a background refresh if
+the cache is stale, keeping the status line snappy.
